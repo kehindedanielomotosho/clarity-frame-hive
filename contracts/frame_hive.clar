@@ -1,11 +1,14 @@
 ;; FrameHive Contract
-;; Handles photo sharing, critiques, and collaboration
+;; Handles photo sharing, critiques, collaboration and gallery curation
 
 ;; Constants
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
 (define-constant err-not-found (err u101))
 (define-constant err-unauthorized (err u102))
+(define-constant err-invalid-gallery (err u103))
+(define-constant gallery-creation-cost u100)
+(define-constant min-curator-reputation u50)
 
 ;; Data structures
 (define-map photos 
@@ -46,10 +49,29 @@
     }
 )
 
+(define-map galleries
+    { gallery-id: uint }
+    {
+        curator: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        photos: (list 50 uint),
+        created-at: uint,
+        views: uint,
+        rating: uint
+    }
+)
+
+(define-map gallery-votes
+    { gallery-id: uint, voter: principal }
+    { rating: uint }
+)
+
 ;; Data variables
 (define-data-var photo-count uint u0)
 (define-data-var comment-count uint u0)
 (define-data-var collab-count uint u0)
+(define-data-var gallery-count uint u0)
 
 ;; Photo functions
 (define-public (upload-photo (title (string-ascii 100)) (description (string-ascii 500)) (ipfs-hash (string-ascii 64)))
@@ -87,6 +109,68 @@
         )
         (var-set comment-count new-count)
         (ok comment-id)
+    )
+)
+
+;; Gallery curation functions
+(define-public (create-gallery (title (string-ascii 100)) (description (string-ascii 500)))
+    (let
+        ((curator-rep (get score (get-user-reputation tx-sender))))
+        (asserts! (>= curator-rep min-curator-reputation) err-unauthorized)
+        (let
+            ((gallery-id (var-get gallery-count))
+             (new-count (+ gallery-id u1)))
+            (map-set galleries
+                { gallery-id: gallery-id }
+                {
+                    curator: tx-sender,
+                    title: title,
+                    description: description,
+                    photos: (list),
+                    created-at: block-height,
+                    views: u0,
+                    rating: u0
+                }
+            )
+            (var-set gallery-count new-count)
+            (ok gallery-id)
+        )
+    )
+)
+
+(define-public (add-photo-to-gallery (gallery-id uint) (photo-id uint))
+    (let ((gallery (unwrap! (map-get? galleries { gallery-id: gallery-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get curator gallery)) err-unauthorized)
+        (ok (map-set galleries
+            { gallery-id: gallery-id }
+            (merge gallery
+                { photos: (unwrap! (as-max-len? (append (get photos gallery) photo-id) u50) err-invalid-gallery) }
+            )
+        ))
+    )
+)
+
+(define-public (rate-gallery (gallery-id uint) (rating uint))
+    (begin
+        (asserts! (<= rating u5) err-invalid-gallery)
+        (map-set gallery-votes
+            { gallery-id: gallery-id, voter: tx-sender }
+            { rating: rating }
+        )
+        (let ((gallery (unwrap! (map-get? galleries { gallery-id: gallery-id }) err-not-found)))
+            (map-set galleries
+                { gallery-id: gallery-id }
+                (merge gallery { rating: (/ (+ (get rating gallery) rating) u2) })
+            )
+            (award-curator-points (get curator gallery) rating)
+            (ok true)
+        )
+    )
+)
+
+(define-private (award-curator-points (curator principal) (rating uint))
+    (let ((points (* rating u10)))
+        (award-points curator points)
     )
 )
 
@@ -133,4 +217,12 @@
 
 (define-read-only (get-collaboration (collab-id uint))
     (map-get? collaborations { collab-id: collab-id })
+)
+
+(define-read-only (get-gallery (gallery-id uint))
+    (map-get? galleries { gallery-id: gallery-id })
+)
+
+(define-read-only (get-gallery-rating (gallery-id uint) (voter principal))
+    (map-get? gallery-votes { gallery-id: gallery-id, voter: voter })
 )
