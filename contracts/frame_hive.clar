@@ -9,51 +9,46 @@
 (define-constant err-invalid-gallery (err u103))
 (define-constant err-rate-limit (err u104))
 (define-constant err-paused (err u105))
+(define-constant err-invalid-input (err u106))
 (define-constant gallery-creation-cost u100)
 (define-constant min-curator-reputation u50)
 (define-constant rate-limit-blocks u144) ;; 24 hours in blocks
+(define-constant max-batch-size u10)
+(define-constant ipfs-hash-prefix "Qm")
 
 ;; Contract status
 (define-data-var contract-paused bool false)
 
-;; Rate limiting
-(define-map rating-timestamps
-    { user: principal, gallery-id: uint }
-    { last-rated: uint }
-)
-
-;; Events
-(define-data-var last-event-id uint u0)
-(define-map events 
-    { event-id: uint }
+;; Enhanced statistics tracking
+(define-map gallery-stats
+    { gallery-id: uint }
     {
-        event-type: (string-ascii 20),
-        user: principal,
-        data: (string-ascii 256)
+        total-ratings: uint,
+        rating-sum: uint,
+        view-count: uint,
+        last-updated: uint
     }
 )
 
-;; [Previous data structures remain unchanged]
+;; Rate limiting with dynamic cooldown
+(define-map rating-timestamps
+    { user: principal, gallery-id: uint }
+    { 
+        last-rated: uint,
+        rating-count: uint
+    }
+)
 
-;; Admin functions
-(define-public (pause-contract)
-    (begin
-        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (var-set contract-paused true)
-        (ok true)
+;; Input validation
+(define-private (is-valid-ipfs-hash (hash (string-ascii 64)))
+    (match (string-slice? hash 0 2)
+        success (is-eq success ipfs-hash-prefix)
+        false
     )
 )
 
-(define-public (unpause-contract)
-    (begin
-        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (var-set contract-paused false)
-        (ok true)
-    )
-)
-
-;; Event emission
-(define-private (emit-event (event-type (string-ascii 20)) (data (string-ascii 256)))
+;; Enhanced event emission with categories
+(define-private (emit-event (event-type (string-ascii 20)) (category (string-ascii 20)) (data (string-ascii 256)))
     (let
         ((event-id (var-get last-event-id))
          (new-id (+ event-id u1)))
@@ -61,8 +56,10 @@
             { event-id: event-id }
             {
                 event-type: event-type,
+                category: category,
                 user: tx-sender,
-                data: data
+                data: data,
+                timestamp: block-height
             }
         )
         (var-set last-event-id new-id)
@@ -70,66 +67,69 @@
     )
 )
 
-;; Enhanced photo functions
-(define-public (transfer-photo-ownership (photo-id uint) (new-owner principal))
-    (let ((photo (unwrap! (map-get? photos { photo-id: photo-id }) err-not-found)))
-        (asserts! (is-eq tx-sender (get owner photo)) err-unauthorized)
-        (map-set photos
-            { photo-id: photo-id }
-            (merge photo { owner: new-owner })
+;; Enhanced photo upload with validation
+(define-public (upload-photo (title (string-ascii 100)) (description (string-ascii 500)) (ipfs-hash (string-ascii 64)))
+    (begin
+        (asserts! (not (var-get contract-paused)) err-paused)
+        (asserts! (is-valid-ipfs-hash ipfs-hash) err-invalid-input)
+        
+        (let ((photo-id (var-get photo-count)))
+            (map-set photos
+                { photo-id: photo-id }
+                {
+                    title: title,
+                    description: description,
+                    ipfs-hash: ipfs-hash,
+                    owner: tx-sender,
+                    created-at: block-height
+                }
+            )
+            (var-set photo-count (+ photo-id u1))
+            (emit-event "PHOTO_UPLOAD" "content" (concat (uint-to-ascii photo-id) "-uploaded"))
+            (ok photo-id)
         )
-        (emit-event "PHOTO_TRANSFER" (concat (uint-to-ascii photo-id) "-transferred"))
-        (ok true)
     )
 )
 
-(define-public (batch-upload-photos (photo-data (list 10 {
-    title: (string-ascii 100),
-    description: (string-ascii 500),
-    ipfs-hash: (string-ascii 64)
-})))
-    (fold upload-photo-from-batch photo-data (ok (list)))
-)
-
-(define-private (upload-photo-from-batch 
-    (data {
-        title: (string-ascii 100),
-        description: (string-ascii 500),
-        ipfs-hash: (string-ascii 64)
-    }) 
-    (previous-result (response (list uint) uint)))
-    (match previous-result
-        success (let ((photo-id (var-get photo-count)))
-            (upload-photo (get title data) (get description data) (get ipfs-hash data))
-            (ok (append success photo-id)))
-        error (err error))
-)
-
-;; Enhanced gallery rating
+;; Enhanced gallery rating with statistics
 (define-public (rate-gallery (gallery-id uint) (rating uint))
-    (let ((last-rating (default-to { last-rated: u0 }
-            (map-get? rating-timestamps { user: tx-sender, gallery-id: gallery-id }))))
+    (let 
+        ((last-rating (default-to { last-rated: u0, rating-count: u0 }
+            (map-get? rating-timestamps { user: tx-sender, gallery-id: gallery-id })))
+         (stats (default-to { total-ratings: u0, rating-sum: u0, view-count: u0, last-updated: u0 }
+            (map-get? gallery-stats { gallery-id: gallery-id }))))
+        
         (asserts! (not (var-get contract-paused)) err-paused)
         (asserts! (>= (- block-height (get last-rated last-rating)) rate-limit-blocks) err-rate-limit)
         (asserts! (<= rating u5) err-invalid-gallery)
         
         (map-set rating-timestamps
             { user: tx-sender, gallery-id: gallery-id }
-            { last-rated: block-height }
+            { 
+                last-rated: block-height,
+                rating-count: (+ (get rating-count last-rating) u1)
+            }
         )
         
-        (map-set gallery-votes
-            { gallery-id: gallery-id, voter: tx-sender }
-            { rating: rating }
+        (map-set gallery-stats
+            { gallery-id: gallery-id }
+            {
+                total-ratings: (+ (get total-ratings stats) u1),
+                rating-sum: (+ (get rating-sum stats) rating),
+                view-count: (get view-count stats),
+                last-updated: block-height
+            }
         )
         
         (let ((gallery (unwrap! (map-get? galleries { gallery-id: gallery-id }) err-not-found)))
             (map-set galleries
                 { gallery-id: gallery-id }
-                (merge gallery { rating: (/ (+ (get rating gallery) rating) u2) })
+                (merge gallery { 
+                    rating: (/ (get rating-sum stats) (get total-ratings stats))
+                })
             )
             (award-curator-points (get curator gallery) rating)
-            (emit-event "GALLERY_RATED" (concat (uint-to-ascii gallery-id) "-rated"))
+            (emit-event "GALLERY_RATED" "interaction" (concat (uint-to-ascii gallery-id) "-rated"))
             (ok true)
         )
     )
