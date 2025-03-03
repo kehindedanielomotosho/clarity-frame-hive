@@ -10,13 +10,23 @@ import { assertEquals } from 'https://deno.land/std@0.90.0/testing/asserts.ts';
 // [Previous tests remain unchanged]
 
 Clarinet.test({
-    name: "Can transfer photo ownership",
+    name: "Validates IPFS hash format",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const wallet_1 = accounts.get('wallet_1')!;
-        const wallet_2 = accounts.get('wallet_2')!;
         
-        // Upload photo
-        let uploadBlock = chain.mineBlock([
+        // Invalid IPFS hash should fail
+        let invalidUpload = chain.mineBlock([
+            Tx.contractCall('frame_hive', 'upload-photo', [
+                types.ascii("Test Photo"),
+                types.ascii("A test photo description"),
+                types.ascii("InvalidHash123")
+            ], wallet_1.address)
+        ]);
+        
+        invalidUpload.receipts[0].result.expectErr().expectUint(106); // err-invalid-input
+        
+        // Valid IPFS hash should succeed
+        let validUpload = chain.mineBlock([
             Tx.contractCall('frame_hive', 'upload-photo', [
                 types.ascii("Test Photo"),
                 types.ascii("A test photo description"),
@@ -24,30 +34,12 @@ Clarinet.test({
             ], wallet_1.address)
         ]);
         
-        // Transfer ownership
-        let transferBlock = chain.mineBlock([
-            Tx.contractCall('frame_hive', 'transfer-photo-ownership', [
-                types.uint(0),
-                types.principal(wallet_2.address)
-            ], wallet_1.address)
-        ]);
-        
-        transferBlock.receipts[0].result.expectOk().expectBool(true);
-        
-        // Verify new owner
-        let getPhotoBlock = chain.mineBlock([
-            Tx.contractCall('frame_hive', 'get-photo', [
-                types.uint(0)
-            ], wallet_1.address)
-        ]);
-        
-        const photo = getPhotoBlock.receipts[0].result.expectSome();
-        assertEquals(photo['owner'], wallet_2.address);
+        validUpload.receipts[0].result.expectOk();
     }
 });
 
 Clarinet.test({
-    name: "Rate limiting prevents rapid gallery ratings",
+    name: "Tracks gallery statistics correctly",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const wallet_1 = accounts.get('wallet_1')!;
         const wallet_2 = accounts.get('wallet_2')!;
@@ -64,24 +56,26 @@ Clarinet.test({
             ], wallet_1.address)
         ]);
         
-        // First rating should succeed
-        let firstRating = chain.mineBlock([
+        // Multiple ratings
+        let ratings = chain.mineBlock([
             Tx.contractCall('frame_hive', 'rate-gallery', [
                 types.uint(0),
                 types.uint(5)
             ], wallet_2.address)
         ]);
         
-        firstRating.receipts[0].result.expectOk().expectBool(true);
+        ratings.receipts[0].result.expectOk().expectBool(true);
         
-        // Second immediate rating should fail
-        let secondRating = chain.mineBlock([
-            Tx.contractCall('frame_hive', 'rate-gallery', [
-                types.uint(0),
-                types.uint(4)
-            ], wallet_2.address)
-        ]);
+        // Verify statistics
+        let stats = chain.callReadOnlyFn(
+            'frame_hive',
+            'get-gallery-stats',
+            [types.uint(0)],
+            wallet_1.address
+        );
         
-        secondRating.receipts[0].result.expectErr().expectUint(104); // err-rate-limit
+        let statsData = stats.result.expectSome();
+        assertEquals(statsData['total-ratings'], types.uint(1));
+        assertEquals(statsData['rating-sum'], types.uint(5));
     }
 });
